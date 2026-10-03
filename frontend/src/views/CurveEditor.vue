@@ -24,11 +24,13 @@
             <span class="panel__title">曲线编辑器 · {{ current.curveName }}</span>
             <div class="curve__head-ops">
               <span class="muted">适用布种</span>
-              <el-select v-model="fabricType" size="small" style="width: 150px" @change="revalidate">
+              <el-select v-model="fabricType" size="small" style="width: 160px">
                 <el-option v-for="f in fabrics" :key="f.fabricType" :label="`${f.fabricName}（≤${f.maxRampRate}℃/min）`" :value="f.fabricType" />
               </el-select>
+              <span class="muted">入染温度</span>
+              <el-input-number v-model="startTemp" :min="20" :max="140" :step="1" size="small" style="width: 104px" />
               <el-button size="small" @click="revalidate">校验速率</el-button>
-              <el-button type="primary" size="small" @click="save">保存节点</el-button>
+              <el-button type="primary" size="small" :loading="saving" @click="save">保存节点</el-button>
             </div>
           </div>
           <div class="panel__body">
@@ -82,10 +84,37 @@
           </div>
         </div>
 
+        <!-- 预检问题（来自后端共用校验，逐节点 + 原因） -->
+        <el-alert
+          v-if="serverErrors.length"
+          class="curve__alert"
+          type="error"
+          :closable="false"
+          show-icon
+          title="草稿预检未通过（保存会被同样拒绝）"
+        >
+          <ul class="curve__alert-list">
+            <li v-for="(e, i) in serverErrors" :key="i">
+              <b v-if="e.nodeIndex != null">节点 {{ e.nodeIndex }}：</b>
+              <b v-else>表头：</b>{{ e.message }}
+            </li>
+          </ul>
+        </el-alert>
+        <el-alert
+          v-else-if="serverChecked"
+          class="curve__alert"
+          type="success"
+          :closable="false"
+          show-icon
+          :title="`预检通过：按布种 ${fabricTypeLabel}、起始温度 ${startTemp}℃ 与当前 ${nodes.length} 个节点同一口径，保存不会再按另一套上限拒绝`"
+        />
+
         <!-- 分段速率表 -->
         <div class="panel">
           <div class="panel__head">
-            <span class="panel__title">分段速率 · 上限 {{ maxRampRate }}℃/min（{{ fabricName }}）</span>
+            <span class="panel__title">
+              分段速率 · 上限 {{ maxRampRate != null ? maxRampRate + '℃/min' : '—' }}（{{ fabricTypeLabel }}）
+            </span>
             <span class="muted">总时长 {{ totalMinutes }}′ · 全曲线峰值 {{ peakRate }}℃/min</span>
           </div>
           <div class="panel__body">
@@ -101,7 +130,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(s, i) in segments" :key="i" :class="s.overLimit ? 'is-bad' : ''">
+                <tr v-for="(s, i) in rowSegments" :key="i" :class="rowIssues(i).length ? 'is-bad' : ''">
                   <td>{{ i + 1 }}</td>
                   <td>
                     <el-select v-model="nodes[i].stage" size="small" style="width:92px">
@@ -111,13 +140,12 @@
                     </el-select>
                   </td>
                   <td>{{ s.from }}℃ → {{ s.to }}℃</td>
-                  <td>{{ s.duration }}</td>
+                  <td :class="s.duration <= 0 ? 'bad-num' : ''">{{ s.duration }}</td>
                   <td class="num" :class="s.overLimit ? 'bad-num' : ''">{{ s.rate.toFixed(2) }}</td>
                   <td>
-                    <span v-if="s.overLimit" class="bad-tip">
-                      升温速率 {{ s.rate.toFixed(2) }}℃/min 已超布种上限 {{ maxRampRate }}℃/min，请拖长该段时长
-                    </span>
-                    <span v-else-if="s.overTemp" class="bad-tip">节点温度超过布种保温上限</span>
+                    <div v-if="rowIssues(i).length" class="bad-tip">
+                      <div v-for="(msg, j) in rowIssues(i)" :key="j">· {{ msg }}</div>
+                    </div>
                     <span v-else class="ok-tip">正常</span>
                   </td>
                 </tr>
@@ -135,7 +163,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, watch, onBeforeUnmount, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getCurve, listCurves, listFabrics, saveCurveNodes, validateCurve } from '../api'
 
@@ -155,19 +183,21 @@ const startTemp = ref(30)
 const fabricType = ref('COTTON')
 const dragging = ref(null)
 const svgEl = ref(null)
+const saving = ref(false)
 
-const maxRampRate = computed(() => {
-  const f = fabrics.value.find((x) => x.fabricType === fabricType.value)
-  return f ? Number(f.maxRampRate) : 3
-})
-const fabricName = computed(() => {
-  const f = fabrics.value.find((x) => x.fabricType === fabricType.value)
-  return f ? f.fabricName : fabricType.value
-})
-const maxHoldTemp = computed(() => {
-  const f = fabrics.value.find((x) => x.fabricType === fabricType.value)
-  return f ? Number(f.maxHoldTemp) : 130
-})
+// 最近一次后端预检结果（预检与保存共用同一套校验口径）；草稿一变即作废，避免陈旧提示
+const serverResult = ref(null)
+const serverChecked = ref(false)
+
+const fabricProfile = computed(
+  () => fabrics.value.find((x) => x.fabricType === fabricType.value) || null
+)
+const maxRampRate = computed(() => (fabricProfile.value ? Number(fabricProfile.value.maxRampRate) : null))
+const maxHoldTemp = computed(() => (fabricProfile.value ? Number(fabricProfile.value.maxHoldTemp) : null))
+const fabricName = computed(() => (fabricProfile.value ? fabricProfile.value.fabricName : fabricType.value))
+const fabricTypeLabel = computed(() =>
+  fabricProfile.value ? `${fabricProfile.value.fabricName}（${fabricType.value}）` : fabricType.value
+)
 const totalMinutes = computed(() => nodes.value.reduce((s, n) => s + (Number(n.durationMin) || 0), 0))
 const timeMax = computed(() => Math.max(totalMinutes.value * 1.12, 60))
 
@@ -188,18 +218,40 @@ const segments = computed(() => {
     const to = Number(n.targetTemp)
     const duration = Number(n.durationMin) || 0
     const rate = duration > 0 ? (to - from) / duration : 0
-    const overLimit = n.stage === 'RAMP' && rate > maxRampRate.value
+    const overLimit = maxRampRate.value != null && n.stage === 'RAMP' && rate > maxRampRate.value
     out.push({
       stage: n.stage, from, to, duration, rate,
       t0: t, t1: t + duration,
       overLimit,
-      overTemp: to > maxHoldTemp.value
+      overTemp: maxHoldTemp.value != null && to > maxHoldTemp.value
     })
     from = to
     t += duration
   })
   return out
 })
+
+// 服务端逐段结果（若预检过则以后端为准），否则回退本地即时计算
+const serverSegments = computed(() => serverResult.value?.segments || [])
+const rowSegments = computed(() =>
+  segments.value.map((s, i) => {
+    const sv = serverSegments.value[i]
+    return sv
+      ? { ...s, rate: Number(sv.rate), overLimit: !!sv.overLimit, overTemp: !!sv.overTemp }
+      : s
+  })
+)
+const serverErrors = computed(() => serverResult.value?.errors || [])
+const nodeErrorMap = computed(() => {
+  const m = {}
+  for (const e of serverErrors.value) {
+    if (e.nodeIndex != null) (m[e.nodeIndex] ||= []).push(e.message)
+  }
+  return m
+})
+function rowIssues(i) {
+  return nodeErrorMap.value[i + 1] || []
+}
 
 const points = computed(() => {
   const out = []
@@ -212,13 +264,13 @@ const points = computed(() => {
 })
 
 const peakRate = computed(() => {
-  const ramps = segments.value.filter((s) => s.stage === 'RAMP').map((s) => s.rate)
+  const ramps = rowSegments.value.filter((s) => s.stage === 'RAMP').map((s) => s.rate)
   return ramps.length ? Math.max(...ramps).toFixed(2) : '0.00'
 })
 
 const linePath = computed(() => {
   let d = `M ${xOf(0)} ${yOf(Number(startTemp.value))}`
-  points.value.forEach((p) => { d += ` L ${p.x} ${p.y}` })
+  points.value.forEach((p) => { d += `L ${p.x} ${p.y}` })
   return d
 })
 
@@ -238,6 +290,30 @@ function stageColor(stage) {
   if (stage === 'COOL') return '#0277bd'
   return '#4a148c'
 }
+
+/** 草稿三件套（布种、起始温度、节点序列）始终完整进入预检与保存链路 */
+function buildPayload() {
+  return {
+    curveName: current.value.curveName,
+    fabricType: fabricType.value,
+    colorCode: current.value.colorCode,
+    recipeId: current.value.recipeId,
+    startTemp: startTemp.value,
+    nodes: nodes.value.map((n) => ({
+      id: n.id,
+      stage: n.stage,
+      targetTemp: n.targetTemp,
+      durationMin: n.durationMin,
+      memo: n.memo
+    }))
+  }
+}
+
+// 草稿任何变化都让上一轮服务端结果作废：切回原布种会在下次预检/保存时按新口径重算
+watch([fabricType, startTemp, nodes], () => {
+  serverResult.value = null
+  serverChecked.value = false
+}, { deep: true })
 
 function startDrag(index, e) {
   dragging.value = index
@@ -293,6 +369,8 @@ function select(curve) {
   }))
   startTemp.value = Number(curve.startTemp)
   fabricType.value = curve.fabricType
+  serverResult.value = null
+  serverChecked.value = false
 }
 
 async function load() {
@@ -306,40 +384,55 @@ async function load() {
   }
 }
 
+/**
+ * 预检：携带完整草稿（布种 + 起始温度 + 节点序列）。
+ * 后端只算不存，逐节点返回问题；预检本身绝不通过/失败都改动编辑器内容。
+ */
 async function revalidate() {
   try {
-    const res = await validateCurve(current.value.id, {
-      fabricType: fabricType.value,
-      nodes: nodes.value
-    })
-    const segs = res.data.segments || []
-    ElMessage.success(segs.some((s) => s.overLimit) ? '存在超速率段，请查看提示' : '速率校验通过')
+    const res = await validateCurve(current.value.id, buildPayload())
+    serverResult.value = res.data
+    serverChecked.value = true
+    if (res.data.valid) {
+      ElMessage.success('预检通过：当前布种、起始温度与节点序列均可保存')
+    } else {
+      ElMessage.warning(`预检发现 ${res.data.errors.length} 项问题，请查看逐节点提示`)
+    }
   } catch (e) {
+    // 网络/系统级失败：不清空编辑内容
     ElMessage.error(e.message)
   }
 }
 
 async function save() {
-  const bad = segments.value.find((s) => s.overLimit)
-  if (bad) {
-    ElMessage.error(`第 ${segments.value.indexOf(bad) + 1} 段升温速率 ${bad.rate.toFixed(2)}℃/min 超过上限 ${maxRampRate.value}℃/min`)
+  // 先用与保存完全相同的口径预检一遍（同一后端方法，不会再出现两套上限）
+  let check
+  try {
+    check = await validateCurve(current.value.id, buildPayload())
+  } catch (e) {
+    ElMessage.error(`预检失败，未执行保存：${e.message}`)
     return
   }
+  serverResult.value = check.data
+  serverChecked.value = true
+  if (!check.data.valid) {
+    ElMessage.error(`预检未通过（${check.data.errors.length} 项），已保留全部编辑内容，调整后可再次保存`)
+    return
+  }
+  saving.value = true
   try {
-    const res = await saveCurveNodes(current.value.id, {
-      curveName: current.value.curveName,
-      fabricType: fabricType.value,
-      colorCode: current.value.colorCode,
-      recipeId: current.value.recipeId,
-      startTemp: startTemp.value,
-      nodes: nodes.value
-    })
+    const res = await saveCurveNodes(current.value.id, buildPayload())
     ElMessage.success(res.message || '节点已保存')
+    // 仅在保存成功后刷新；失败/预检拒绝都不覆盖草稿
     const fresh = await getCurve(current.value.id)
     current.value = fresh.data
+    curves.value = curves.value.map((c) => (c.id === fresh.data.id ? fresh.data : c))
     select(fresh.data)
   } catch (e) {
+    // 后端保存仍按同一套规则校验：失败时保留编辑内容，可继续修改
     ElMessage.error(e.message)
+  } finally {
+    saving.value = false
   }
 }
 
@@ -399,4 +492,7 @@ load()
 .bad-tip { color: #c62828; font-size: 12px; }
 .ok-tip { color: #2e7d32; font-size: 12px; }
 .curve__foot { margin-top: 10px; display: flex; gap: 8px; }
+.curve__alert { margin-top: 14px; }
+.curve__alert-list { margin: 4px 0 0; padding-left: 18px; }
+.curve__alert-list li { margin: 2px 0; line-height: 1.5; }
 </style>
