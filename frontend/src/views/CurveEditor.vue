@@ -27,6 +27,9 @@
               <el-select v-model="fabricType" size="small" style="width: 150px" @change="revalidate">
                 <el-option v-for="f in fabrics" :key="f.fabricType" :label="`${f.fabricName}（≤${f.maxRampRate}℃/min）`" :value="f.fabricType" />
               </el-select>
+              <span class="muted">入染温度</span>
+              <el-input-number v-model="startTemp" :min="20" :max="140" :step="5" size="small"
+                               style="width: 110px" controls-position="right" @change="revalidate" />
               <el-button size="small" @click="revalidate">校验速率</el-button>
               <el-button type="primary" size="small" @click="save">保存节点</el-button>
             </div>
@@ -89,6 +92,10 @@
             <span class="muted">总时长 {{ totalMinutes }}′ · 全曲线峰值 {{ peakRate }}℃/min</span>
           </div>
           <div class="panel__body">
+            <el-alert v-if="serverErrors.length" type="error" :closable="false" class="curve__errors"
+                      title="服务端校验未通过（与保存口径一致）">
+              <div v-for="(err, i) in serverErrors" :key="i">{{ err }}</div>
+            </el-alert>
             <table class="seg-table">
               <thead>
                 <tr>
@@ -101,7 +108,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(s, i) in segments" :key="i" :class="s.overLimit ? 'is-bad' : ''">
+                <tr v-for="(s, i) in segments" :key="i" :class="s.overLimit || s.overTemp || s.duration <= 0 ? 'is-bad' : ''">
                   <td>{{ i + 1 }}</td>
                   <td>
                     <el-select v-model="nodes[i].stage" size="small" style="width:92px">
@@ -114,10 +121,11 @@
                   <td>{{ s.duration }}</td>
                   <td class="num" :class="s.overLimit ? 'bad-num' : ''">{{ s.rate.toFixed(2) }}</td>
                   <td>
-                    <span v-if="s.overLimit" class="bad-tip">
+                    <span v-if="s.duration <= 0" class="bad-tip">第 {{ i + 1 }} 个节点时长必须大于 0 分钟</span>
+                    <span v-else-if="s.overLimit" class="bad-tip">
                       升温速率 {{ s.rate.toFixed(2) }}℃/min 已超布种上限 {{ maxRampRate }}℃/min，请拖长该段时长
                     </span>
-                    <span v-else-if="s.overTemp" class="bad-tip">节点温度超过布种保温上限</span>
+                    <span v-else-if="s.overTemp" class="bad-tip">节点温度超过布种保温上限 {{ maxHoldTemp }}℃</span>
                     <span v-else class="ok-tip">正常</span>
                   </td>
                 </tr>
@@ -155,6 +163,7 @@ const startTemp = ref(30)
 const fabricType = ref('COTTON')
 const dragging = ref(null)
 const svgEl = ref(null)
+const serverErrors = ref([])
 
 const maxRampRate = computed(() => {
   const f = fabrics.value.find((x) => x.fabricType === fabricType.value)
@@ -293,6 +302,7 @@ function select(curve) {
   }))
   startTemp.value = Number(curve.startTemp)
   fabricType.value = curve.fabricType
+  serverErrors.value = []
 }
 
 async function load() {
@@ -307,22 +317,38 @@ async function load() {
 }
 
 async function revalidate() {
+  if (!current.value) return
   try {
+    // 预检携带完整草稿（布种 + 起始温度 + 节点序列），与保存链路同一口径
     const res = await validateCurve(current.value.id, {
       fabricType: fabricType.value,
+      startTemp: startTemp.value,
       nodes: nodes.value
     })
-    const segs = res.data.segments || []
-    ElMessage.success(segs.some((s) => s.overLimit) ? '存在超速率段，请查看提示' : '速率校验通过')
+    const data = res.data || {}
+    serverErrors.value = data.errors || []
+    if (data.valid) {
+      ElMessage.success(`校验通过：${data.fabricName} 上限 ${data.maxRampRate}℃/min，保存将按同一口径放行`)
+    } else {
+      ElMessage.warning(serverErrors.value[0] || '存在超限段，请查看提示')
+    }
   } catch (e) {
+    serverErrors.value = [e.message]
     ElMessage.error(e.message)
   }
 }
 
 async function save() {
-  const bad = segments.value.find((s) => s.overLimit)
+  // 本地预检与服务端同一套规则（零时长 / 升温超限 / 温度上限），先拦一轮省往返
+  const bad = segments.value.find((s) => s.duration <= 0 || s.overLimit || s.overTemp)
   if (bad) {
-    ElMessage.error(`第 ${segments.value.indexOf(bad) + 1} 段升温速率 ${bad.rate.toFixed(2)}℃/min 超过上限 ${maxRampRate.value}℃/min`)
+    const i = segments.value.indexOf(bad) + 1
+    const reason = bad.duration <= 0
+      ? '时长必须大于 0 分钟'
+      : bad.overLimit
+        ? `升温速率 ${bad.rate.toFixed(2)}℃/min 超过布种上限 ${maxRampRate.value}℃/min`
+        : `节点温度超过布种保温上限 ${maxHoldTemp.value}℃`
+    ElMessage.error(`第 ${i} 段${reason}，请调整后再保存`)
     return
   }
   try {
@@ -335,10 +361,12 @@ async function save() {
       nodes: nodes.value
     })
     ElMessage.success(res.message || '节点已保存')
+    // 保存成功后才用库内最新数据刷新画布；失败时保留编辑内容
     const fresh = await getCurve(current.value.id)
     current.value = fresh.data
     select(fresh.data)
   } catch (e) {
+    serverErrors.value = [e.message]
     ElMessage.error(e.message)
   }
 }
@@ -388,6 +416,7 @@ load()
 .curve__legend i { width: 12px; height: 4px; border-radius: 2px; display: inline-block; }
 
 .seg-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.curve__errors { margin-bottom: 10px; }
 .seg-table th {
   background: var(--mill-primary-wash); color: var(--mill-ink);
   text-align: left; padding: 8px; border-bottom: 1px solid var(--mill-line);

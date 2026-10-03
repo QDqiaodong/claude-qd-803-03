@@ -21,9 +21,15 @@ import com.dyeing.mill.repository.ProcessCurveRepository;
 
 /**
  * 工艺曲线业务：节点序列有序保存、各段升温速率计算与布种上限拦截。
+ *
+ * 预检（validate）与保存（saveNodes/create）共用同一份「草稿解析 + 规则计算」：
+ * 草稿 = 请求里携带的布种/起始温度/节点序列，缺省字段回落到曲线已保存值。
+ * 因此编辑器里改完布种、拖完节点后看到的提示，与保存时的拦截口径完全一致。
  */
 @Service
 public class CurveService {
+
+    private static final BigDecimal DEFAULT_START_TEMP = BigDecimal.valueOf(30);
 
     private final ProcessCurveRepository curveRepository;
     private final FabricProfileRepository fabricProfileRepository;
@@ -60,13 +66,14 @@ public class CurveService {
         curve.setFabricType(payload.getFabricType());
         curve.setColorCode(payload.getColorCode());
         curve.setRecipeId(payload.getRecipeId());
-        curve.setStartTemp(payload.getStartTemp() == null ? BigDecimal.valueOf(30) : payload.getStartTemp());
+        curve.setStartTemp(payload.getStartTemp() == null ? DEFAULT_START_TEMP : payload.getStartTemp());
         applyNodes(curve, payload.getNodes());
         return curveRepository.save(curve);
     }
 
     /**
-     * 更新曲线节点（拖动节点后保存）。
+     * 更新曲线节点（拖动节点后保存）。布种/起始温度/节点序列以草稿为准，
+     * 校验不通过时整体回滚，库内保持原样。
      */
     @Transactional
     public ProcessCurve saveNodes(Long id, CurvePayload payload) {
@@ -93,18 +100,45 @@ public class CurveService {
     }
 
     /**
-     * 只看不算：返回每段速率与是否超限，供编辑器实时提示（不拦截）。
+     * 只看不算：按草稿（布种/起始温度/节点序列）实时校验并返回每段速率与问题清单，不落库。
+     * 请求缺省的字段回落到已保存值，兼容只传节点序列的旧调用。
      */
+    @Transactional(readOnly = true)
     public Map<String, Object> validate(Long id, CurvePayload payload) {
         ProcessCurve curve = detail(id);
-        FabricProfile profile = profileOf(curve.getFabricType());
-        List<CurveNodeInput> inputs = payload.getNodes() == null ? curveNodesToInputs(curve) : payload.getNodes();
+        CurveDraft draft = resolveDraft(curve, payload);
+        FabricProfile profile = profileOf(draft.fabricType());
+
+        List<Map<String, Object>> segments = computeSegments(draft.startTemp(), draft.nodes(), profile);
+        List<String> problems = segmentProblems(segments, profile);
+
         Map<String, Object> data = new LinkedHashMap<>();
-        data.put("fabricType", curve.getFabricType());
+        data.put("fabricType", draft.fabricType());
         data.put("fabricName", profile.getFabricName());
         data.put("maxRampRate", profile.getMaxRampRate());
-        data.put("segments", computeSegments(curve.getStartTemp(), inputs, profile));
+        data.put("maxHoldTemp", profile.getMaxHoldTemp());
+        data.put("startTemp", draft.startTemp());
+        data.put("segments", segments);
+        data.put("errors", problems);
+        data.put("valid", problems.isEmpty());
         return data;
+    }
+
+    /**
+     * 解析草稿：预检与保存都以此为准。请求未携带的字段回落到曲线已保存值；
+     * 节点序列缺省（null 或空）时按已保存节点校验。
+     */
+    private CurveDraft resolveDraft(ProcessCurve curve, CurvePayload payload) {
+        String fabricType = payload.getFabricType() == null || payload.getFabricType().isBlank()
+                ? curve.getFabricType() : payload.getFabricType();
+        BigDecimal startTemp = payload.getStartTemp() != null ? payload.getStartTemp()
+                : (curve.getStartTemp() == null ? DEFAULT_START_TEMP : curve.getStartTemp());
+        List<CurveNodeInput> nodes = payload.getNodes() == null || payload.getNodes().isEmpty()
+                ? curveNodesToInputs(curve) : payload.getNodes();
+        return new CurveDraft(fabricType, startTemp, nodes);
+    }
+
+    private record CurveDraft(String fabricType, BigDecimal startTemp, List<CurveNodeInput> nodes) {
     }
 
     private List<CurveNodeInput> curveNodesToInputs(ProcessCurve curve) {
@@ -123,7 +157,8 @@ public class CurveService {
 
     private FabricProfile profileOf(String fabricType) {
         return fabricProfileRepository.findByFabricType(fabricType)
-                .orElseThrow(() -> new BizException("未找到布种 " + fabricType + " 的工艺档案，无法校验升温速率"));
+                .orElseThrow(() -> new BizException("布种 " + fabricType
+                        + " 缺少有效工艺档案（不存在或已停用），无法校验升温速率与温度上限，请先在布种档案中维护"));
     }
 
     private void applyNodes(ProcessCurve curve, List<CurveNodeInput> inputs) {
@@ -131,22 +166,12 @@ public class CurveService {
             throw new BizException("工艺曲线至少需要一个节点");
         }
         FabricProfile profile = profileOf(curve.getFabricType());
-        BigDecimal startTemp = curve.getStartTemp() == null ? BigDecimal.valueOf(30) : curve.getStartTemp();
+        BigDecimal startTemp = curve.getStartTemp() == null ? DEFAULT_START_TEMP : curve.getStartTemp();
 
-        List<Map<String, Object>> segments = computeSegments(startTemp, inputs, profile);
-
-        // ---- 规则：升温速率不得超过布种允许上限 ----
-        for (Map<String, Object> seg : segments) {
-            if (Boolean.TRUE.equals(seg.get("overLimit"))) {
-                throw new BizException("第 " + seg.get("index") + " 段升温速率 " + seg.get("rate")
-                        + "℃/min 超过布种 " + profile.getFabricName() + "（" + profile.getFabricType()
-                        + "）允许上限 " + profile.getMaxRampRate() + "℃/min，请放缓升温或延长该段时长");
-            }
-            if (Boolean.TRUE.equals(seg.get("overTemp"))) {
-                throw new BizException("第 " + seg.get("index") + " 个节点温度 " + seg.get("toTemp")
-                        + "℃ 超过布种 " + profile.getFabricName() + " 允许的保温上限 "
-                        + profile.getMaxHoldTemp() + "℃");
-            }
+        // ---- 与预检共用的同一套规则：零时长节点 / 升温超限 / 温度上限 ----
+        List<String> problems = segmentProblems(computeSegments(startTemp, inputs, profile), profile);
+        if (!problems.isEmpty()) {
+            throw new BizException(problems.get(0));
         }
 
         curve.getNodes().clear();
@@ -176,22 +201,21 @@ public class CurveService {
     }
 
     /**
-     * 逐段计算速率（℃/min）与超限标记。
+     * 逐段计算速率（℃/min）与超限标记。预检与保存共用，保证两条链路口径一致。
      */
     private List<Map<String, Object>> computeSegments(BigDecimal startTemp, List<CurveNodeInput> inputs,
                                                       FabricProfile profile) {
         List<Map<String, Object>> segments = new ArrayList<>();
-        BigDecimal cursor = startTemp == null ? BigDecimal.valueOf(30) : startTemp;
+        BigDecimal cursor = startTemp == null ? DEFAULT_START_TEMP : startTemp;
         int index = 1;
         for (CurveNodeInput input : inputs) {
             BigDecimal target = nvl(input.getTargetTemp());
             int duration = input.getDurationMin() == null ? 0 : input.getDurationMin();
-            if (duration <= 0) {
-                throw new BizException("第 " + index + " 个节点的时长必须大于 0 分钟");
-            }
+            boolean zeroDuration = duration <= 0;
             BigDecimal rate = rateOf(cursor, target, duration);
             String stage = input.getStage() == null ? "HOLD" : input.getStage();
-            boolean overLimit = "RAMP".equalsIgnoreCase(stage) && rate.compareTo(profile.getMaxRampRate()) > 0;
+            boolean overLimit = !zeroDuration && "RAMP".equalsIgnoreCase(stage)
+                    && rate.compareTo(profile.getMaxRampRate()) > 0;
             boolean overTemp = target.compareTo(profile.getMaxHoldTemp()) > 0;
 
             Map<String, Object> seg = new LinkedHashMap<>();
@@ -202,6 +226,7 @@ public class CurveService {
             seg.put("durationMin", duration);
             seg.put("rate", rate);
             seg.put("maxRampRate", profile.getMaxRampRate());
+            seg.put("zeroDuration", zeroDuration);
             seg.put("overLimit", overLimit);
             seg.put("overTemp", overTemp);
             segments.add(seg);
@@ -210,6 +235,30 @@ public class CurveService {
             index++;
         }
         return segments;
+    }
+
+    /**
+     * 逐段生成问题描述（指出第几个节点/第几段 + 原因）。
+     * 预检把全量清单返回给编辑器，保存抛第一条拦截，两处措辞一致。
+     */
+    private List<String> segmentProblems(List<Map<String, Object>> segments, FabricProfile profile) {
+        String fabricLabel = profile.getFabricName() + "（" + profile.getFabricType() + "）";
+        List<String> problems = new ArrayList<>();
+        for (Map<String, Object> seg : segments) {
+            if (Boolean.TRUE.equals(seg.get("zeroDuration"))) {
+                problems.add("第 " + seg.get("index") + " 个节点的时长必须大于 0 分钟，否则无法计算升温速率");
+            }
+            if (Boolean.TRUE.equals(seg.get("overLimit"))) {
+                problems.add("第 " + seg.get("index") + " 段升温速率 " + seg.get("rate")
+                        + "℃/min 超过布种 " + fabricLabel + " 允许上限 " + profile.getMaxRampRate()
+                        + "℃/min，请放缓升温或延长该段时长");
+            }
+            if (Boolean.TRUE.equals(seg.get("overTemp"))) {
+                problems.add("第 " + seg.get("index") + " 个节点温度 " + seg.get("toTemp")
+                        + "℃ 超过布种 " + fabricLabel + " 允许的保温上限 " + profile.getMaxHoldTemp() + "℃");
+            }
+        }
+        return problems;
     }
 
     private BigDecimal rateOf(BigDecimal from, BigDecimal to, int duration) {
