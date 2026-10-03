@@ -1,0 +1,36 @@
+# 仅本地端到端验证：H2(MySQL 方言) 建表 + 种子。docker 部署不使用本文件。
+# SQL 通过 file: URL 从 harness 目录加载（启动脚本里设置 spring.config.additional-location）。
+spring:
+  datasource:
+    url: jdbc:h2:mem:mill;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  sql:
+    init:
+      mode: always
+      schema-locations: file:./harness/schema-h2.sql
+      data-locations: file:./harness/data-h2.sql
+  jpa:
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: Asia/Shanghai
+  jackson:
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+
+server:
+  port: 8399
+
+logging:
+  level:
+    com.dyeing.mill: INFO
